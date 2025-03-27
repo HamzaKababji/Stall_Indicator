@@ -1,4 +1,5 @@
 #include <stdint.h>
+#include <math.h>        // For sqrt() if you want to compute stall velocity at runtime
 
 // ----- Memory-Mapped Hardware Addresses -----
 // ADC Base and Offsets
@@ -11,12 +12,19 @@
 #define JP1_DATA_OFFSET   0x00   // Data register
 #define JP1_DIR_OFFSET    0x04   // Direction register
 
-// Slide Switches Base (SW0 is on bit 0)
+// Slide Switches Base (SW0 is on bit 0) — not strictly needed here
 #define SW_BASE           0xFF200040
 
+// ----- Aircraft / Aerodynamics Parameters -----
+// Weight in Newtons for 100,000 kg (100,000 * 9.8 = 980,000 N)
+#define WEIGHT        980000.0f 
+#define RHO           1.225f      // Air density at sea level (kg/m^3)
+#define WING_AREA     125.0f      // Wing area (m^2)
+#define CL_MAX        1.2f        // Maximum lift coefficient
+#define MAX_AOA       15.0f       // AoA limit for stall condition (degrees)
+
 // ----- Delay Function -----
-// Simple busy-wait delay to slow down the loop for observable LED changes.
-void delay(void) {
+static void delay(void) {
     for (volatile int i = 0; i < 100000; i++) {
         ; // Do nothing
     }
@@ -25,71 +33,67 @@ void delay(void) {
 int main(void)
 {
     // Pointers for ADC registers (volatile because these are hardware registers)
-    volatile uint32_t *adc_ch0_ptr  = (volatile uint32_t *)(ADC_BASE + ADC_CH0_OFFSET);
-    volatile uint32_t *adc_ch1_ptr  = (volatile uint32_t *)(ADC_BASE + ADC_CH1_OFFSET);
+    volatile int *adc_ch0_ptr  = (volatile int *)(ADC_BASE + ADC_CH0_OFFSET);
+    volatile int *adc_ch1_ptr  = (volatile int *)(ADC_BASE + ADC_CH1_OFFSET);
     
     // Pointers for GPIO registers for JP1 (LED display)
-    volatile uint32_t *jp1_data_ptr = (volatile uint32_t *)(JP1_BASE + JP1_DATA_OFFSET);
-    volatile uint32_t *jp1_dir_ptr  = (volatile uint32_t *)(JP1_BASE + JP1_DIR_OFFSET);
+    volatile int *jp1_data_ptr = (volatile int *)(JP1_BASE + JP1_DATA_OFFSET);
+    volatile int *jp1_dir_ptr  = (volatile int *)(JP1_BASE + JP1_DIR_OFFSET);
     
-    // Pointer for Slide Switches
-    volatile uint32_t *sw_ptr       = (volatile uint32_t *)SW_BASE;
+    // (Optional) Pointer for Slide Switches, if needed
+    // volatile uint32_t *sw_ptr       = (volatile uint32_t *)SW_BASE;
     
     // ----- Configure GPIO -----
-    // Set pins 0 to 9 of JP1 as outputs (for the 10 LEDs).
-    // 0x3FF in hex is binary 11 1111 1111, which sets bits 0..9 to output.
-    *jp1_dir_ptr = 0x3FF;
+    *jp1_dir_ptr = 0x3FF;  // Set pins 0..9 to output (for 10 LEDs)
     
     // ----- Initialize ADC -----
-    // Write any value to channel 0 to update all ADC channels once.
-    *adc_ch0_ptr = 1;
-    // Write any value to channel 1 to enable continuous (auto-update) ADC conversion.
-    *adc_ch1_ptr = 1;
+    *adc_ch0_ptr = 1; // Update all ADC channels once
+    *adc_ch1_ptr = 1; // Enable continuous (auto-update) ADC conversion
+    
+    // ----- Compute Stall Velocity -----
+    // V_stall = sqrt( (2 * W) / (rho * WingArea * CL_max) )
+    float velocity_stall = sqrtf((2.0f * WEIGHT) / (RHO * WING_AREA * CL_MAX));
     
     while (1)
     {
-        // ----- Read the Slide Switch -----
-        // Mask off SW0 (bit 0). When SW0 is low, use ADC channel 0; when high, use ADC channel 1.
-        uint32_t sw0 = (*sw_ptr) & 0x1;
+        // Read both ADC channels
+        int raw_ch0 = *adc_ch0_ptr;  // Potentially "velocity" pot
+        int raw_ch1 = *adc_ch1_ptr;  // Potentially "AoA" pot
         
-        uint32_t adc_read;
-        if (sw0 == 0)
+        // Check if both conversions have completed
+        if ((raw_ch0 & 0x10000) && (raw_ch1 & 0x10000))
         {
-            adc_read = *adc_ch0_ptr;
-        }
-        else
-        {
-            adc_read = *adc_ch1_ptr;
+            // Extract the 12-bit ADC values (bits [11:0])
+            int adc_val0 = raw_ch0 & 0xFFF;  // Velocity pot raw
+            int adc_val1 = raw_ch1 & 0xFFF;  // AoA pot raw
+            
+            // ----- Convert ADC values to physical units -----
+            // Velocity: 0..4095 => 0..300 m/s
+            float current_velocity = (adc_val0 / 4095.0f) * 300.0f;
+            
+            // AoA: (adc_val1/4095 - 0.5) * 60 => range of -30..+30 degrees
+            float current_AoA = ((adc_val1 / 4095.0f) - 0.5f) * 60.0f;
+            
+            // ----- Stall Logic -----
+            // If velocity < V_stall OR AoA > MAX_AOA => stall
+            int stalling = (current_velocity < velocity_stall) || (current_AoA > MAX_AOA);
+            
+            // ----- Drive LEDs -----
+            if (stalling)
+            {
+                // Turn on all 10 LEDs (bits 0..9 => 0x3FF)
+                *jp1_data_ptr = 0x3FF;
+            }
+            else
+            {
+                // Turn off all LEDs
+                *jp1_data_ptr = 0x000;
+            }
         }
         
-        // ----- Check for ADC Conversion Completion -----
-        // Bit 15 is set when conversion is complete.
-        if (adc_read & 0x10000) // change to 0x8000 for hardware
-        {
-            // Extract the 12-bit ADC value (bits [11:0])
-            uint32_t adc_value = adc_read & 0xFFF;
-            
-            // ----- Convert ADC Reading to LED Bar Graph -----
-            // Scale the 12-bit value (0–4095) into a value between 0 and 10.
-            uint32_t led_count = (adc_value * 10) / 4095;
-            if (led_count > 10)
-                led_count = 10;
-            
-            // Create a bar graph: for example, if led_count is 5, then we want bits 0 to 4 on.
-            // (1 << led_count) gives a binary 1 shifted led_count times.
-            // Subtracting 1 produces a mask of led_count 1's. (e.g., (1<<5)-1 = 0x1F)
-            uint32_t led_mask = (led_count > 0) ? ((1 << led_count) - 1) : 0;
-            
-            // Write the mask to the GPIO data register to drive the LEDs.
-            *jp1_data_ptr = led_mask;
-        }
-        // Optionally, if the conversion is not complete (bit15 is 0), you could
-        // implement error handling or simply try again on the next loop iteration.
-        
-        // Delay so that LED changes are observable (especially in cpulator).
+        // Delay to slow the loop
         delay();
     }
     
-    // This return is never reached.
-    return 0;
+    return 0; // Never reached
 }
